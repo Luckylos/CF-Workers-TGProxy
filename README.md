@@ -91,7 +91,7 @@ TG 客户端本身就有多流、并且会自动分流，所以 lanes 让**每�
 ```
 
 - `upPack = 20KB`：上行单次合包目标
-- `dnPack = 32KB`：下行聚合上限；`>= 32KB` 直接发，`< 32KB` 进核再等门控
+- `dnPack = 32KB`：下行聚合上限；`>= 32KB` 直接发，`< 32KB` 进核再等门控。合包（`mkPack`）在 `dial` 之上实现一次，KWS 和出站代理两条路径共用；同一时刻只有一个未完成的读取，保留 TCP 背压
 - `dnMs = 1ms`：下行 quiet-window，用来决定何时 flush
 
 目的都是削减高频小 `frame` 带来的固定调度成本，而不是再造一层重型队列。
@@ -99,7 +99,7 @@ TG 客户端本身就有多流、并且会自动分流，所以 lanes 让**每�
 ### 3. 鉴权与租约
 
 - 页面只下发一次性 `nonce` + 短期 `bootstrap`（`mkBoot`，2 分钟）
-- `POST /api/v1/session` 校验 bootstrap 后签发 `session` token（`mkSess`，5 分钟）
+- `POST /api/v1/session` 校验 bootstrap 后签发 `session` token（`mkSess`，5 分钟）；也接受仍有效的 session token 换新 token，桥接页面每 3 分钟自动刷新一次（失败 15 秒后重试），避免 5 分钟后新 lane 鉴权失败拖垮整个页面
 - 每个 session token 对应一份 `lease`，记录 `active` / `used` sid、过期与删除状态
 - `DELETE /api/v1/session` 置 `lease.deleted`，后续 lane 直接 `409`/关闭
 - token 为 HMAC-SHA256 截断签名，签名/比较走常量时间
@@ -133,6 +133,7 @@ TG 客户端本身就有多流、并且会自动分流，所以 lanes 让**每�
 | --- | --- | --- |
 | `SECRET` | 代理密钥：AES-CTR 传输密钥派生 + `?bridge=` 能力签名 | `32` 位 hex，或 `dd` / `ee` / `ef` 前缀 + 32 位 hex（共 `34`）；字符集 `0-9a-f`；大小写不敏感，建议小写 |
 | `BOOT` | bootstrap token：签发 bootstrap / session，并内联进下发页面 | 仅要求非空，建议 ≥ `16` 字符随机串 |
+| `PROXY`（可选） | 出站代理，见下文「出站代理」 | `socks5://[user:pass@]host[:port]`（默认端口 `1080`）或 `http://[user:pass@]host[:port]`（默认 `80`）；用户名/密码中的特殊字符需 URL 编码 |
 
 生成命令：
 
@@ -142,7 +143,25 @@ TG 客户端本身就有多流、并且会自动分流，所以 lanes 让**每�
 | `SECRET`（带前缀） | `printf 'dd%s\n' "$(openssl rand -hex 16)"` | `34` 位 hex |
 | `BOOT` | `openssl rand -hex 24` | `48` 位 hex |
 
-`openssl rand` 走系统 CSPRNG，是真随机。任一绑定缺失，`mkCfg` 直接抛错，`/health` 会返回 `500` 而不是 `{"ok":true}`。
+`openssl rand` 走系统 CSPRNG，是真随机。`SECRET` 或 `BOOT` 缺失、或 `PROXY` 格式非法时，`mkCfg` 直接抛错，`/health` 会返回 `500` 而不是 `{"ok":true}`。`/health` 不会探测代理或 Telegram 是否可达。
+
+## 出站代理
+
+配置 `PROXY`（建议用 `wrangler secret put PROXY`）后，**所有 lane** 不再连接 KWS，而是经该代理用 TCP 直连 Telegram DC：
+
+```text
+Worker → (cloudflare:sockets connect) → SOCKS5 / HTTP CONNECT 代理 → Telegram DC{1..5}:443（MTProto obfuscated2）
+```
+
+- 支持 SOCKS5（无认证 / 用户名密码）和 HTTP CONNECT（可选 Basic 认证）。不支持 SOCKS4、UDP、HTTPS 代理。
+- DC 地址表内置在代码 `DCS` 中（仅 IPv4，来源与主流 MTProxy 实现一致）；媒体连接与普通连接使用同一 DC 地址。Telegram 调整地址时需改代码重新部署。
+- 代理连接、认证或 CONNECT 失败、或 7.5 秒内未完成握手时，直接关闭该 lane，由客户端重连；**不回退到 KWS**。
+- 未配置 `PROXY` 时行为与之前完全一致（直连 KWS）。
+- 代理不能位于 Cloudflare IP 段内（Workers TCP Socket 的限制）。
+
+> **风险**：Worker 到代理之间是明文 TCP，SOCKS5 / HTTP Basic 的**用户名和密码以明文经过公网**。Telegram 数据本身仍是加密的。请给代理单独设置强密码，不要复用其他账号凭据。Workers 出口 IP 不固定，代理端 IP 白名单只能放行 Cloudflare 出口段，效果有限。
+
+设计取舍见 [docs/adr/0001](./docs/adr/0001-egress-proxy-direct-dc.md)。
 
 ## 路由
 
@@ -158,11 +177,20 @@ TG 客户端本身就有多流、并且会自动分流，所以 lanes 让**每�
 
 | 文件 | 说明 |
 | --- | --- |
-| [telegram_webproxy.js](./telegram_webproxy.js) | Worker 主实现：页面 / session / lane / obfuscation / KWS 中继 |
+| [telegram_webproxy.js](./telegram_webproxy.js) | Worker 主实现：页面 / session / lane / obfuscation / KWS 中继 / 出站代理 |
+| [test/proxy.test.mjs](./test/proxy.test.mjs) | 出站代理离线测试（假代理），`node --test test/*.test.mjs`，Node ≥ 20，无依赖 |
 
 ## 访问优化（CNAME / SaaS 优选）
 
 - 使用**自有域名 + CNAME**，或直接走 Cloudflare **SaaS（自定义主机名）优选**，以获得更好的接入体验。
+- `?bridge=` 签名按访问时的主机名计算，换任何入口主机名都无需改代码。
+- 客户端链接必须是 WEB proxy 类型：`tg://webproxy?server=<入口主机名>&secret=<SECRET>`（或 `https://t.me/webproxy?...`），需要支持 WEB proxy 的 Telegram 客户端。**不要用 `tg://proxy`**：那是普通 MTProxy，客户端会直接对 443 发原始 TCP，Cloudflare 边缘不会接，表现为一直“连接中”。
+- SaaS 优选部署方式（需要两个域名）：
+  1. 域名 A 托管在 Cloudflare，作为 SaaS zone；建一条 originless 记录（如 `fallback.A`，AAAA `100::`，橙色云）并设为 fallback origin。
+  2. 在 A 的 zone 上给 Worker 加路由 `*/*`（或只对入口主机名加路由），参考 [Workers as your fallback origin](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-for-saas/start/advanced-settings/worker-as-origin/)。
+  3. 在 SaaS 中添加自定义主机名（如 `tg.B`），按提示完成主机名与证书验证。
+  4. 域名 B 的 DNS 不在 Cloudflare：`tg.B` CNAME 到优选域名，或 A 记录到优选 IP（可用 `CF_Preferred_IP` 的结果手动更新）。
+  5. 验证：`https://tg.B/health` 返回 `{"ok":true}`，再用客户端实测。
 - 参考实现中曾出现第三方线路（非官方 `web.telegram.org` 域名）导致边缘层 `1034` / `403`；换成官方 web 域名后恢复正常，因此**优先使用 Telegram 官方 web 域名与稳定的自有 CNAME / Custom Domain**，避免依赖质量不稳定的中间线路。
 
 ## 相关链接
