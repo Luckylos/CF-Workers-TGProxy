@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { W } from './load.mjs';
+import { W, tcpOpen } from './load.mjs';
 
 // 假代理：handler(sock, read) 完成握手后回显
 const fake = async (handler) => {
@@ -129,3 +129,27 @@ test('signal 取消握手', async () => {
   await assert.rejects(p);
   s.srv.close();
 });
+
+// 握手后读 128KB：校验数据完整；握手时多读到的剩余数据（第一块）大小不定，之后每次 read() 不超过 CFG.dnPack
+const bulk = async (open) => {
+  const data = Buffer.alloc(128 * 1024); for (let i = 0; i < data.length; i++) data[i] = (i * 7) & 255;
+  const s = await fake(async ({ sock, readHead }) => { await readHead(); sock.write('HTTP/1.1 200 OK\r\n\r\n'); sock.write(data); sock.end(); });
+  const tcp = await W.dialProxy({ proxy: W.parseProxy(`http://127.0.0.1:${s.port}`), target: 2, ...(open ? { open } : {}) });
+  const parts = []; for (let b; (b = await tcp.read());) parts.push(Buffer.from(b));
+  s.srv.close();
+  return { tcp, parts, ok: Buffer.concat(parts).equals(data) };
+};
+
+test('握手后改用 BYOB 读：数据完整，每块不超过 dnPack', async () => {
+  const { tcp, parts, ok } = await bulk();
+  assert.equal(tcp.mode, 'byob');
+  assert.ok(ok);
+  assert.ok(parts.slice(1).every(p => p.byteLength <= W.CFG.dnPack));
+});
+
+test('socket 不是字节流时回退到默认 reader', async () => {
+  const { tcp, ok } = await bulk(addr => tcpOpen(addr, { bytes: false }));
+  assert.equal(tcp.mode, 'default');
+  assert.ok(ok);
+});
+

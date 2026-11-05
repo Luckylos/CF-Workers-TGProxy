@@ -14,6 +14,7 @@ Cloudflare Workers 上的 Telegram Web Proxy（td web-proxy）后端，单文件
 | **`mkHead` 排除规则补齐** | 生成发往 DC 的 64 字节头时，一并排除 `eeeeeeee` / `dddddddd` / TLS 头（`16030102`），与主流 MTProxy 实现一致 | `badHead` |
 | **lease 上限统一** | `DELETE /api/v1/session` 与 `/api/v1/ws` 共用过期清理与 4096 上限，满时返回 `503` | `getLease` |
 | **关闭 WebSocket 压缩** | 部署配置加 compatibility flag `no_web_socket_compression`。上游在 101 响应里放空的 `Sec-WebSocket-Extensions` 头，实测关不掉压缩（`compatibility_date` ≥ 2023-08-15 时 runtime 默认协商 permessage-deflate）；中继数据是密文压不动，本地 workerd 实测下行 CPU 约 51 → 10.5 ms/MB | `wrangler.toml` 的 `compatibility_flags` |
+| **出站代理改用 BYOB 读** | 握手完成后，TCP adapter 每次给 runtime 一块 32KB 的新缓冲读取，减少 `read()` 次数和合包开销；socket 不是字节流时沿用默认 reader。本地 workerd 实测连续下行 CPU 约 10.2 → 4.5 ms/MB | `toByob`、`mkTcp` |
 | **离线测试** | 新增 `test/`，Node 内置 `node:test`，**零依赖** | `node --test test/*.test.mjs` |
 | **文档** | 术语表、ADR、obfuscation 不变量、SaaS 优选教程 | [GLOSSARY.md](./GLOSSARY.md)、[docs/](./docs) |
 
