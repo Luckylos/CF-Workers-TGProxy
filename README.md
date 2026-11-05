@@ -13,6 +13,7 @@ Cloudflare Workers 上的 Telegram Web Proxy（td web-proxy）后端，单文件
 | **session token 自动刷新** | 桥接页面每 3 分钟用当前 token 换新 token（失败 15 秒后重试）。修复「5 分钟后新 lane 鉴权失败 → 整个页面断开」 | `mkPage` 的 `renew`、`POST /api/v1/session` |
 | **`mkHead` 排除规则补齐** | 生成发往 DC 的 64 字节头时，一并排除 `eeeeeeee` / `dddddddd` / TLS 头（`16030102`），与主流 MTProxy 实现一致 | `badHead` |
 | **lease 上限统一** | `DELETE /api/v1/session` 与 `/api/v1/ws` 共用过期清理与 4096 上限，满时返回 `503` | `getLease` |
+| **关闭 WebSocket 压缩** | 部署配置加 compatibility flag `no_web_socket_compression`。上游在 101 响应里放空的 `Sec-WebSocket-Extensions` 头，实测关不掉压缩（`compatibility_date` ≥ 2023-08-15 时 runtime 默认协商 permessage-deflate）；中继数据是密文压不动，本地 workerd 实测下行 CPU 约 51 → 10.5 ms/MB | `wrangler.toml` 的 `compatibility_flags` |
 | **离线测试** | 新增 `test/`，Node 内置 `node:test`，**零依赖** | `node --test test/*.test.mjs` |
 | **文档** | 术语表、ADR、obfuscation 不变量、SaaS 优选教程 | [GLOSSARY.md](./GLOSSARY.md)、[docs/](./docs) |
 
@@ -27,7 +28,7 @@ Cloudflare Workers 上的 Telegram Web Proxy（td web-proxy）后端，单文件
 - 两种出站：直连 Telegram KWS，或经出站代理 TCP 直连 Telegram DC
 - HMAC 签名的 bootstrap / session token，以及按会话的 lease 记账
 - 上行 / 下行小包汇聚（`upPack = 20KB`、`dnPack = 32KB`、`dnMs = 1ms`）
-- 显式关闭 WebSocket 压缩协商
+- 关闭 WebSocket 压缩（compatibility flag `no_web_socket_compression`）
 
 内层 MTProto 载荷始终由客户端端到端加密，Worker 不接触、也不做 mtp 层加解密。
 
@@ -82,9 +83,12 @@ openssl rand -hex 24   # BOOT：只给 Worker 自己用，不需要告诉别人
 name = "tgproxy"
 main = "telegram_webproxy.js"
 compatibility_date = "2025-06-01"
+compatibility_flags = ["no_web_socket_compression"]
 
 routes = [{ pattern = "tg.example.com/*", zone_name = "example.com" }]
 ```
+
+`compatibility_flags` 这一行不要省略，原因见「设计摘要 → 关闭 WebSocket 压缩」。在控制台部署时，到 Worker 的 Settings → Compatibility flags 里手动添加 `no_web_socket_compression`。
 
 `pattern` 里的主机名就是客户端将来填写的**入口主机名**。若域名不在 Cloudflare，或想走优选 IP，见 [SaaS 优选入口教程](./docs/saas-preferred-entry.md)。
 
@@ -225,9 +229,13 @@ Worker → (cloudflare:sockets connect) → SOCKS5 / HTTP CONNECT 代理 → Tel
 - CSP：`default-src 'none'`、`sandbox allow-same-origin allow-scripts`、`frame-ancestors http://127.0.0.1:*`
 - `/api/v1/ws` 若带 `Origin` 头，必须与自身同源，否则拒绝
 
-### 5. 禁用 WebSocket 压缩协商
+### 5. 关闭 WebSocket 压缩
 
-握手响应显式把 `Sec-WebSocket-Extensions` 置空。中继传的是高熵原始字节流，再做 WS 压缩换不来稳定收益，反而抬高热路径 CPU。
+中继传的是 obfuscation 后的密文，permessage-deflate 压不动，只白白消耗 CPU。本地 workerd 实测：协商压缩时下行约 51 ms CPU/MB，关闭后约 10.5 ms/MB。Free 套餐每次调用（即每条 lane）只有 10 ms CPU，这个差距直接决定一条 lane 传多少数据会被平台结束。
+
+关闭方式是 compatibility flag `no_web_socket_compression`，它同时作用于入站 lane 和 KWS 路径的出站 `new WebSocket()`。在 101 响应里放空的 `Sec-WebSocket-Extensions` 头没有用：`compatibility_date` ≥ 2023-08-15 时 runtime 默认协商压缩，并忽略这个空头。见 [Compatibility flags](https://developers.cloudflare.com/workers/configuration/compatibility-flags/)。
+
+验证方法：客户端在升级请求里带 `Sec-WebSocket-Extensions: permessage-deflate`，101 响应里不应出现该头。
 
 ## 测试
 

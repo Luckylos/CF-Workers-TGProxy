@@ -144,4 +144,4 @@ const route = async (req, env) => {
   if (lease.deleted || lease.used.has(sid) || lease.active.size >= 128 || lease.used.size >= 4096) { return reply(null, 409); } lease.used.add(sid); lease.active.add(sid);
   const sess = mkSession({ secret: cfg.key, proxy: cfg.proxy, sid, lease, onClose: () => lease.active.delete(sid), }); const { 0: client, 1: server } = new WebSocketPair();
   try { sess.attach(server); } catch { sess.close(); return reply(null, 409); }
-  return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Protocol': proto, 'Sec-WebSocket-Extensions': '', }, }); };
+  return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Protocol': proto }, }); };
