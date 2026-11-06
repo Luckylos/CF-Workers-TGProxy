@@ -1,4 +1,4 @@
-// cloudflare:sockets 的 connect() 在 Node 上的实现（node:net）
+// cloudflare:sockets 的 connect() 在 Node 上的实现（node:net）；node/hooks.mjs 把该模块名解析到这里
 import net from 'node:net';
 import { Duplex } from 'node:stream';
 
@@ -27,3 +27,5 @@ export const tcpOpen = ({ hostname, port }, { bytes = true } = {}) => {
   }, { highWaterMark: 64 * 1024 });
   return { opened, readable, writable, close() { s.destroy(); } };
 };
+
+export const connect = addr => tcpOpen(addr);

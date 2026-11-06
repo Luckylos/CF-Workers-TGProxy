@@ -1,11 +1,14 @@
 // Node 中继：在 VPS 上运行 telegram_webproxy.js（第三种部署方式，前面接 Cloudflare Tunnel）
 // 用法：SECRET=... BOOT=... [PROXY=direct] [PORT=8787] [HOST=127.0.0.1] node node/server.mjs
-// 提供 Worker 运行时用到的 connect()（cloudflare:sockets）、WebSocketPair 和 101 Response；业务代码不改。
+// cloudflare:sockets 由 node/hooks.mjs 解析到 node/sockets.mjs；WebSocket 升级通过 mkApp(rt) 的 rt.upgrade 提供。
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { register } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { tcpOpen } from './sockets.mjs';
+
+register('./hooks.mjs', import.meta.url);
+const { mkApp } = await import('../telegram_webproxy.js');
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_MSG = 4 * 1024 * 1024; // 单条消息上限（Worker 侧会拒绝 >2MB 的帧）
@@ -83,31 +86,8 @@ class Peer extends EventTarget {
   }
 }
 
-// Worker 里 new WebSocketPair() 返回 [client, server]；Node 中继只需要服务端一侧，client 指向同一对象
-class WebSocketPair { constructor() { const p = new Peer(); this[0] = p; this[1] = p; } }
-
-// undici 的 Response 不接受 101：记下状态和 webSocket，交给 upgrade 处理
-const NodeResponse = globalThis.Response;
-class Response extends NodeResponse {
-  constructor(body, init = {}) {
-    const ws = init.webSocket, up = init.status === 101;
-    super(body, up ? { ...init, status: 200 } : init);
-    if (up) Object.defineProperty(this, 'status', { value: 101 });
-    this.webSocket = ws ?? null;
-  }
-}
-
-let dialer = tcpOpen;
-export const loadWorker = async (file = new URL('../telegram_webproxy.js', import.meta.url)) => {
-  globalThis.WebSocketPair = WebSocketPair;
-  globalThis.Response = Response;
-  globalThis.__tcpOpen = addr => dialer(addr);
-  let src = await readFile(file, 'utf8');
-  const before = src;
-  src = src.replace(/^import \{ connect \} from 'cloudflare:sockets';$/m, 'const connect = globalThis.__tcpOpen;');
-  if (src === before) throw Error('telegram_webproxy.js: 未找到 cloudflare:sockets import');
-  return (await import('data:text/javascript;base64,' + Buffer.from(src).toString('base64'))).default;
-};
+// Node 侧运行时：升级时返回一个 Peer，server 在 upgrade 事件里把它绑到 socket 上
+const nodeRt = connect => ({ connect, upgrade: proto => { const ws = new Peer(); return { ws, response: { status: 101, webSocket: ws, headers: new Headers({ 'Sec-WebSocket-Protocol': proto }) } }; } });
 
 const toRequest = (req, body, proto) => {
   const headers = new Headers();
@@ -123,9 +103,9 @@ const readBody = req => new Promise((ok, bad) => {
 const plain = (status) => 'HTTP/1.1 ' + status + ' ' + (http.STATUS_CODES[status] || '') + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n';
 
 // proto：访客实际使用的协议，用于拼 URL（Origin 校验依赖它）；经 Cloudflare Tunnel 时是 https
-export const start = async ({ port = 8787, host = '127.0.0.1', env, proto = 'https', connect, worker } = {}) => {
-  if (connect) dialer = connect;
-  const app = worker ?? await loadWorker();
+// connect：可替换的 TCP 打开函数（测试用它指向假 DC），默认 node:net
+export const start = async ({ port = 8787, host = '127.0.0.1', env, proto = 'https', connect = addr => tcpOpen(addr) } = {}) => {
+  const app = mkApp(nodeRt(connect));
   const srv = http.createServer(async (req, res) => {
     try {
       const body = req.method === 'GET' || req.method === 'HEAD' ? null : await readBody(req);

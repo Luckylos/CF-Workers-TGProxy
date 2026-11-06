@@ -37,3 +37,13 @@ _Avoid_: 服务器（未指明数据中心时）
 **DC 直连**:
 面向 Telegram DC 原生传输端点的连接方式，区别于经 KWS 接入；路径中可以经过出站代理。
 _Avoid_: TCP 模式、原生模式
+
+## 部署
+
+**部署方式**:
+此服务运行的形态：Worker 经 KWS、Worker 经出站代理，或 Node 中继。
+_Avoid_: 版本、模式（单独使用时）
+
+**Node 中继**:
+在自有服务器上用 Node 运行同一份 Worker 代码、经 Cloudflare Tunnel 接入的部署方式；默认 DC 直连，不经出站代理。
+_Avoid_: VPS 版、后端
