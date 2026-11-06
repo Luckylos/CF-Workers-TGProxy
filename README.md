@@ -1,14 +1,15 @@
 # CF-Workers-TGProxy（二开版）
 
-Cloudflare Workers 上的 Telegram Web Proxy（td web-proxy）后端，单文件实现：把 Telegram Desktop / Android 在隔离 webview 里发起的 WebSocket lanes，转接到 Telegram。
+Telegram Web Proxy（td web-proxy）后端，单文件实现：把 Telegram Desktop / Android 在隔离 webview 里发起的 WebSocket lanes，转接到 Telegram。同一份 `telegram_webproxy.js` 既可部署到 Cloudflare Workers，也可在自己的服务器上用 Node 运行（Node 中继）。
 
-本仓库是 [ToiCF/CF-Workers-TGProxy](https://github.com/ToiCF/CF-Workers-TGProxy) 的 fork（[Luckylos/CF-Workers-TGProxy](https://github.com/Luckylos/CF-Workers-TGProxy)），在上游「KWS 转换」主线之上增加了**出站代理**，并修复了一批**长连接与下行性能**问题。上游的传输层转换设计、CSP 页面、lane 模型均保留，本文档按二开后的实际行为重写。
+本仓库是 [ToiCF/CF-Workers-TGProxy](https://github.com/ToiCF/CF-Workers-TGProxy) 的 fork（[Luckylos/CF-Workers-TGProxy](https://github.com/Luckylos/CF-Workers-TGProxy)），在上游「KWS 转换」主线之上增加了**出站代理**和 **Node 中继**，并修复了一批**长连接与下行性能**问题。上游的传输层转换设计、CSP 页面、lane 模型均保留，本文档按二开后的实际行为重写。
 
 ## 这个 fork 改了什么
 
 | 改动 | 说明 | 落点 / 依据 |
 | --- | --- | --- |
-| **出站代理** | 新增可选 Secret `PROXY`。配置后所有 lane 经 SOCKS5 / HTTP CONNECT 代理用 TCP 直连 Telegram DC，不再连 KWS；不配置则行为与上游一致 | `dialProxy` / `dialRetry` / `mkTcp` / `parseProxy`、[ADR-0001](./docs/adr/0001-egress-proxy-direct-dc.md) |
+| **出站代理** | 新增可选 Secret `PROXY`。配置后所有 lane 经 SOCKS5 / HTTP CONNECT 代理用 TCP 直连 Telegram DC，不再连 KWS；不配置则行为与上游一致 | `dialProxy` / `mkTcp` / `parseProxy`、[ADR-0001](./docs/adr/0001-egress-proxy-direct-dc.md) |
+| **Node 中继** | 在自己的服务器上用 Node 运行同一份 Worker 代码，前面接 Cloudflare Tunnel，从服务器直连 Telegram DC（`PROXY=direct`）。不受 Workers Free 单次调用 10ms CPU 的限制，下行明显更流畅；零 npm 依赖 | `node/server.mjs`、`node/hooks.mjs`、`mkApp(rt)` |
 | **下行合包统一** | 合包（`mkPack`）上移到 `dial` 之上，KWS 与代理两条路径共用；同一时刻只有一个未完成的读取，保留 TCP 背压。此前代理路径每个 TCP chunk 都单独成一帧 | `mkPack`、`dial`；本地 workerd 实测下行消息数约降为 1/8 |
 | **session token 自动刷新** | 桥接页面每 3 分钟用当前 token 换新 token（失败 15 秒后重试）。修复「5 分钟后新 lane 鉴权失败 → 整个页面断开」 | `mkPage` 的 `renew`、`POST /api/v1/session` |
 | **`mkHead` 排除规则补齐** | 生成发往 DC 的 64 字节头时，一并排除 `eeeeeeee` / `dddddddd` / TLS 头（`16030102`），与主流 MTProxy 实现一致 | `badHead` |
@@ -26,7 +27,7 @@ Cloudflare Workers 上的 Telegram Web Proxy（td web-proxy）后端，单文件
 - Android 应用内 web-proxy 桥（`globalThis.TelegramWebProxy` 双向 postMessage）
 - 多 lane WebSocket 复用：子协议 `tproxy-lane-v1.<token>.<sid>`
 - MTProto 传输层 obfuscation 重签（mode `0xef` / `0xee` / `0xdd`，DC `1..5`，media 标志）
-- 两种出站：直连 Telegram KWS，或经出站代理 TCP 直连 Telegram DC
+- 三种出站：直连 Telegram KWS；经出站代理 TCP 直连 Telegram DC；Node 中继从服务器 TCP 直连 Telegram DC
 - HMAC 签名的 bootstrap / session token，以及按会话的 lease 记账
 - 上行 / 下行小包汇聚（`upPack = 20KB`、`dnPack = 32KB`、`dnMs = 1ms`）
 - 关闭 WebSocket 压缩（compatibility flag `no_web_socket_compression`）
@@ -46,6 +47,7 @@ flowchart LR
   PK --> D{"dial"}
   D -->|"未配置 PROXY"| KWS["wss://kwsN[-1].web.telegram.org/apiws"]
   D -->|"配置 PROXY"| DC["SOCKS5 / HTTP CONNECT 代理 → Telegram DC1-5:443 (obfuscated2)"]
+  D -->|"PROXY=direct（Node 中继）"| DC2["服务器 TCP → Telegram DC1-5:443 (obfuscated2)"]
 ```
 
 ```text
@@ -56,7 +58,23 @@ webview 页面
   → Worker: 解 obfuscation → 重新封头 → dial（KWS 或出站代理）→ 中继
 ```
 
-## 部署教程
+## 部署方式
+
+| | 方式一：Worker（无代理） | 方式二：Worker + HTTP / SOCKS5 出站代理 | 方式三：Node 中继 |
+| --- | --- | --- | --- |
+| 运行位置 | Cloudflare Workers | Cloudflare Workers | 自己的服务器，经 Cloudflare Tunnel 接入 |
+| 到 Telegram | Worker → KWS（`wss://kwsN.web.telegram.org`） | Worker → 代理 → DC1–5:443 | 服务器 → DC1–5:443 |
+| 需要 | Cloudflare 账号 + 托管域名 | 再加一个 Cloudflare IP 段以外的 SOCKS5 / HTTP 代理 | 再加一台能直连 Telegram DC 的服务器（Node ≥ 22，约 40–70MB 内存） |
+| CPU 限制 | Workers Free 单次调用 10ms | 同左 | 无 |
+| 适合 | 上手最快 | KWS 线路差、手上有代理 | 追求流畅：大文件、视频下行 |
+
+方式一、二按下面的「部署教程（Worker）」做，二者只差第 5 步。方式三见「部署教程（Node 中继）」。三种方式的客户端链接格式相同，`SECRET` / `BOOT` 可以共用。
+
+> Workers Free 对单次调用限制 10ms CPU，一条 lane 从建立到关闭算一次调用。下行大文件时 CPU 主要花在 AES 和 `ws.send` 上（约 4–10 ms/MB），超限后 lane 会被中断、客户端重连，表现为卡顿。方式三没有这个限制；方式一、二可以升级 Workers Paid（单次 CPU 上限 30 秒）。
+>
+> Cloudflare 服务条款不允许 Free 套餐主要用 CDN 承载非网页的大流量。三种方式的流量都经过 Cloudflare，请自行评估。
+
+## 部署教程（Worker）
 
 ### 0. 前置条件
 
@@ -103,13 +121,19 @@ printf 'YOUR_BOOT\n'   | wrangler secret put BOOT
 
 > 也可以把 `SECRET` / `BOOT` 写进普通环境变量，但 Secret 更合适：它在控制台不可见，也不会被下次 `deploy` 覆盖。
 
-### 5. （可选）配置出站代理
+### 5. 配置出站代理（仅方式二）
+
+方式一跳过这一步。方式二把代理地址写进 Secret `PROXY`，HTTP CONNECT 或 SOCKS5 均可：
 
 ```bash
 printf 'http://user:pass@proxy.example:8080\n' | wrangler secret put PROXY
 ```
 
-不配置就直连 Telegram KWS；配置后所有 lane 改走代理直连 Telegram DC。详见下文「出站代理」。
+```bash
+printf 'socks5://user:pass@proxy.example:1080\n' | wrangler secret put PROXY
+```
+
+配置后所有 lane 改走代理直连 Telegram DC，代理失败时关闭 lane，不回退 KWS。改回方式一：`wrangler secret delete PROXY`。详见下文「出站代理」。
 
 ### 6. 验证
 
@@ -132,6 +156,112 @@ tg://webproxy?server=tg.example.com&secret=YOUR_SECRET
 
 > **不要用 `tg://proxy`**。那是普通 MTProxy 链接，客户端会直接对 443 端口发原始 MTProto 数据，而 Cloudflare 边缘只接 HTTPS —— 表现是一直卡在「连接中」。
 
+## 部署教程（Node 中继）
+
+Node 中继在服务器上运行同一份 `telegram_webproxy.js`（入口 `node/server.mjs`），只监听 `127.0.0.1`，由 Cloudflare Tunnel 把域名接进来，服务器不用开放任何入站端口。TLS 由 Cloudflare 边缘终止。
+
+### 0. 前置条件
+
+- 一台 Linux 服务器，能直连 Telegram DC 的 443 端口。先测一下（DC2，任一 DC 能通即可判断）：
+
+  ```bash
+  timeout 5 bash -c 'exec 3<>/dev/tcp/149.154.167.51/443' && echo ok
+  ```
+
+  不通的话，可以在第 2 步把 `PROXY` 设成 SOCKS5 / HTTP 代理，格式同方式二。
+- Node.js ≥ 22（`node --version`），不需要 npm 包。
+- 一个 Cloudflare 账号和已托管的域名（下面记作 `example.com`）。
+
+### 1. 取代码
+
+```bash
+git clone https://github.com/Luckylos/CF-Workers-TGProxy /opt/tgproxy
+```
+
+运行只用到 `telegram_webproxy.js` 和 `node/`。以后升级：`git -C /opt/tgproxy pull && systemctl restart tgproxy-relay`。
+
+### 2. 写配置
+
+```bash
+install -m 600 /dev/null /etc/tgproxy.env
+cat > /etc/tgproxy.env <<'EOF'
+SECRET=YOUR_SECRET
+BOOT=YOUR_BOOT
+PROXY=direct
+PORT=8787
+HOST=127.0.0.1
+EOF
+```
+
+`SECRET` / `BOOT` 的生成方法同 Worker 教程第 2 步；已经部署过 Worker 的，可以直接沿用那一对，客户端链接只换 `server`。`PROXY=direct` 表示从服务器直连 DC，不写时默认也是 `direct`。
+
+### 3. 配置 systemd
+
+`/etc/systemd/system/tgproxy-relay.service`（`ExecStart` 里的 node 路径换成 `command -v node` 的结果）：
+
+```ini
+[Unit]
+Description=tgproxy Node relay (behind Cloudflare Tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tgproxy.env
+ExecStart=/usr/local/bin/node /opt/tgproxy/node/server.mjs
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=200M
+Environment=NODE_OPTIONS=--max-old-space-size=128
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now tgproxy-relay
+curl -s http://127.0.0.1:8787/health   # 期望：{"ok":true}
+```
+
+### 4. 接入 Cloudflare Tunnel
+
+1. Cloudflare 控制台 → Zero Trust → Networks → Tunnels → Create a tunnel，类型选 Cloudflared，按页面提示在服务器上安装并运行 connector。
+2. 在该 tunnel 的 Public Hostname 里添加：Subdomain `tg`，Domain `example.com`，Service `HTTP` → `127.0.0.1:8787`。Cloudflare 会自动创建 `tg.example.com` 的 CNAME。
+
+服务器上已经有 tunnel 的，直接在它上面加一条 Public Hostname 即可。
+
+### 5. 验证与客户端链接
+
+```bash
+curl https://tg.example.com/health
+# 期望：{"ok":true}
+```
+
+客户端链接同 Worker 教程第 7 步：`tg://webproxy?server=tg.example.com&secret=YOUR_SECRET`。
+
+### 6. （可选）配合 SaaS 优选入口
+
+已按 [docs/saas-preferred-entry.md](./docs/saas-preferred-entry.md) 配好 SaaS 自定义主机名的，可以只把该主机名的回源换成 Tunnel，入口和优选线路不变：
+
+1. 在 SaaS zone 里加一条开代理的 CNAME，例如 `tgrelay.<SaaS zone>` → `<tunnel-id>.cfargotunnel.com`。
+2. 把该自定义主机名的 Origin server（`custom_origin_server`）设为这条记录。其他主机名仍走 fallback origin，不受影响。
+3. 在 tunnel 的 ingress 里加一条规则，hostname 写**客户端访问的主机名**（如 `tg.example.com`），service `http://127.0.0.1:8787`。这一步只改 ingress，不要让控制台替你创建 DNS 记录，否则会覆盖原来指向优选入口的 CNAME。
+4. 删除该主机名原来的 Worker 路由，流量即切到 Node 中继。Worker 脚本可以保留，出问题时把路由加回来就能回退。
+
+### 运维说明
+
+- 日志只记录启动，不记录连接：`journalctl -u tgproxy-relay`。
+- 重启服务会断开所有 lane，客户端会自动重连。
+- session / lease 状态在进程内存里，与 Worker 一样不跨实例共享。
+
 ## 配置
 
 ### 环境变量 / Secret
@@ -140,7 +270,9 @@ tg://webproxy?server=tg.example.com&secret=YOUR_SECRET
 | --- | --- | --- | --- |
 | `SECRET` | 是 | AES-CTR 传输密钥派生 + `?bridge=` 能力签名；也是客户端链接里的 secret | `32` 位 hex，或 `dd` / `ee` / `ef` 前缀 + 32 位 hex（共 `34`）；字符集 `0-9a-f`，大小写不敏感 |
 | `BOOT` | 是 | 签发 bootstrap / session token，并内联进下发页面 | 非空即可，建议 ≥ 16 字符随机串 |
-| `PROXY` | 否 | 出站代理 | `socks5://[user:pass@]host[:port]`（默认 `1080`）或 `http://[user:pass@]host[:port]`（默认 `80`）；用户名/密码需 URL 编码；`#` 之后的内容会被忽略，可用来写备注 |
+| `PROXY` | 否 | 出站代理 | `socks5://[user:pass@]host[:port]`（默认 `1080`）或 `http://[user:pass@]host[:port]`（默认 `80`）；用户名/密码需 URL 编码；`#` 之后的内容会被忽略，可用来写备注。`direct` 表示不经代理直连 DC，供 Node 中继使用（Node 中继不写时默认 `direct`，Worker 不写时走 KWS） |
+| `PORT` / `HOST` | 否 | 仅 Node 中继：监听地址 | 默认 `8787` / `127.0.0.1` |
+| `PROTO` | 否 | 仅 Node 中继：重建请求 URL 用的协议，与客户端访问一致 | 默认 `https`（TLS 在 Cloudflare 边缘终止） |
 
 任一必填项缺失或 `PROXY` 非法时，`mkCfg` 抛错，`/health` 返回 `500`。
 
@@ -246,6 +378,7 @@ node --test test/*.test.mjs
 
 - `test/proxy.test.mjs`：`parseProxy`、`mkCfg`、`dcAddr`、SOCKS5 / HTTP CONNECT 握手、认证失败、超时、取消、握手后双向转发
 - `test/fixes.test.mjs`：下行合包（`mkPack`）、`mkHead` 排除规则、lease 上限、token 续期；桥接页面的续期逻辑在 `vm` 里真实运行页面脚本验证
+- `test/node.test.mjs`：`PROXY=direct`；Node 中继端到端（`/health`、错误握手、完整 lane 经假 DC 双向核对明文）
 - `test/load.mjs`：测试用加载器，把 `cloudflare:sockets` 替换为 `node:net` 实现并导出内部符号
 
 仅依赖 Node 内置模块。真实 Telegram 连接、真实代理线路、Cloudflare 平台行为需要部署后验收。
@@ -260,11 +393,15 @@ node --test test/*.test.mjs
 - **页面缓冲满即整体断开**：全会话队列达上限时 `fail()` 会断开整个页面，而不是只对单个 lane 施加背压。
 - **状态是 isolate 内的**：`leases` / `macKeys` 是模块级 `Map`，无 Durable Object；注销与配额只按 isolate 生效。
 - **`/health` 不探测上游**：只验证配置。
+- **Node 中继的 WebSocket 服务端是手写的最小实现**：只覆盖本项目用到的 RFC 6455 子集（单条消息上限 4MB），不处理扩展协商。
 
 ## 目录结构
 
 ```text
-telegram_webproxy.js              单文件 Worker（唯一部署产物）
+telegram_webproxy.js              单文件 Worker（Worker 的唯一部署产物）
+node/server.mjs                   Node 中继入口（HTTP + WebSocket 服务端）
+node/hooks.mjs                    loader hook：cloudflare:sockets → node/sockets.mjs
+node/sockets.mjs                  connect() 的 node:net 实现
 test/                             离线测试（node:test，零依赖）
 GLOSSARY.md                       领域术语表
 docs/adr/                         架构决策记录
