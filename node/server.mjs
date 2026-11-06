@@ -1,5 +1,5 @@
 // Node 中继：在 VPS 上运行 telegram_webproxy.js（第三种部署方式，前面接 Cloudflare Tunnel）
-// 用法：SECRET=... BOOT=... [PROXY=direct] [PORT=8787] [HOST=127.0.0.1] node node/server.mjs
+// 用法：SECRET=... BOOT=... [PROXY=direct] [DECOY=https://site] [PORT=8787] [HOST=127.0.0.1] node node/server.mjs
 // cloudflare:sockets 由 node/hooks.mjs 解析到 node/sockets.mjs；WebSocket 升级通过 mkApp(rt) 的 rt.upgrade 提供。
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -139,7 +139,7 @@ export const start = async ({ port = 8787, host = '127.0.0.1', env, proto = 'htt
 };
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  const env = { SECRET: process.env.SECRET, BOOT: process.env.BOOT, PROXY: process.env.PROXY ?? 'direct' };
+  const env = { SECRET: process.env.SECRET, BOOT: process.env.BOOT, PROXY: process.env.PROXY ?? 'direct', DECOY: process.env.DECOY };
   if (!env.SECRET || !env.BOOT) { console.error('需要环境变量 SECRET 和 BOOT'); process.exit(1); }
   const s = await start({ port: Number(process.env.PORT || 8787), host: process.env.HOST || '127.0.0.1', env, proto: process.env.PROTO || 'https' });
   console.log('tgproxy relay listening on ' + (process.env.HOST || '127.0.0.1') + ':' + s.port);

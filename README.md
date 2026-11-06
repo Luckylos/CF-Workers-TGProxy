@@ -193,7 +193,9 @@ HOST=127.0.0.1
 EOF
 ```
 
-`SECRET` / `BOOT` 的生成方法同 Worker 教程第 2 步；已经部署过 Worker 的，可以直接沿用那一对，客户端链接只换 `server`。`PROXY=direct` 表示从服务器直连 DC，不写时默认也是 `direct`。
+`SECRET` / `BOOT` 的生成方法同 Worker 教程第 2 步；已经部署过 Worker 的，可以直接沿用那一对，客户端链接只换 `server`。`PROXY=direct` 表示从服务器直连 DC，不写时默认也是 `direct`。想让直接访问域名时看到一个正常网站，再加一行 `DECOY=https://你的博客`，见下文「配置」。
+
+伪装站请用自己的站或开源项目文档站。不要反代知名品牌网站，容易被 Cloudflare 判为钓鱼。
 
 ### 3. 配置 systemd
 
@@ -284,10 +286,11 @@ Node 中继的桥接页面是源站返回的 HTML，会经过 Cloudflare 的 HTM
 | `SECRET` | 是 | AES-CTR 传输密钥派生 + `?bridge=` 能力签名；也是客户端链接里的 secret | `32` 位 hex，或 `dd` / `ee` / `ef` 前缀 + 32 位 hex（共 `34`）；字符集 `0-9a-f`，大小写不敏感 |
 | `BOOT` | 是 | 签发 bootstrap / session token，并内联进下发页面 | 非空即可，建议 ≥ 16 字符随机串 |
 | `PROXY` | 否 | 出站代理 | `socks5://[user:pass@]host[:port]`（默认 `1080`）或 `http://[user:pass@]host[:port]`（默认 `80`）；用户名/密码需 URL 编码；`#` 之后的内容会被忽略，可用来写备注。`direct` 表示不经代理直连 DC，供 Node 中继使用（Node 中继不写时默认 `direct`，Worker 不写时走 KWS） |
+| `DECOY` | 否 | 伪装站：未签名的 `/` 和未知路径透传到该站，直接访问域名看到的是这个网站。只透传 GET/HEAD 和少量请求头，不带 cookie 和访客 IP；同源跳转改为相对路径 | 只写 origin，如 `https://blog.example.com`；不写则保持原来的空白页和空 404 |
 | `PORT` / `HOST` | 否 | 仅 Node 中继：监听地址 | 默认 `8787` / `127.0.0.1` |
 | `PROTO` | 否 | 仅 Node 中继：重建请求 URL 用的协议，与客户端访问一致 | 默认 `https`（TLS 在 Cloudflare 边缘终止） |
 
-任一必填项缺失或 `PROXY` 非法时，`mkCfg` 抛错，`/health` 返回 `500`。
+任一必填项缺失或 `PROXY` / `DECOY` 非法时，`mkCfg` 抛错，`/health` 返回 `500`。
 
 ### 代码内常量
 
