@@ -256,6 +256,19 @@ curl https://tg.example.com/health
 3. 在 tunnel 的 ingress 里加一条规则，hostname 写**客户端访问的主机名**（如 `tg.example.com`），service `http://127.0.0.1:8787`。这一步只改 ingress，不要让控制台替你创建 DNS 记录，否则会覆盖原来指向优选入口的 CNAME。
 4. 删除该主机名原来的 Worker 路由，流量即切到 Node 中继。Worker 脚本可以保留，出问题时把路由加回来就能回退。
 
+### 注意事项：关闭 Rocket Loader
+
+Node 中继的桥接页面是源站返回的 HTML，会经过 Cloudflare 的 HTML 改写功能；Worker 生成的页面不会，所以从 Worker 切到 Node 中继时容易踩到。
+
+- **现象**：`/health` 正常，`/` 返回 200，但客户端一直连不上。边缘日志里只有反复的 `GET /`，没有 `POST /api/v1/session`。已有会话还能续期，所以往往在旧会话过期后才「突然」连不上。
+- **原因**：Rocket Loader 会改写页面里的 `<script>` 并注入自己的脚本。页面 CSP 只放行带 nonce 的脚本，改写后页面脚本不执行，也就不会建立会话。Email Obfuscation 同样会改写 HTML。
+- **处理**：在流量**进入的那个 zone** 里（用 SaaS 优选入口时是 SaaS zone，不是客户端主机名所在的 zone）加一条 Configuration Rule：
+
+  - 表达式：`(http.host eq "tg.example.com")`
+  - 设置：Rocket Loader 关、Email Obfuscation 关
+
+  只对这个主机名生效，不影响同 zone 的其他站点。整个 zone 都不需要 Rocket Loader 的，直接在 Speed → Optimization 里关掉也可以。
+
 ### 运维说明
 
 - 日志只记录启动，不记录连接：`journalctl -u tgproxy-relay`。
