@@ -16,7 +16,7 @@ const PACKETS = Buffer.concat([PKT(400), PKT(400), PKT(400)]);
 const fakeDc = async () => {
   const st = { got: 0, conns: 0, tag: null, plain: Buffer.alloc(0) };
   const srv = net.createServer(s => {
-    st.conns++; s.on('error', () => {}); let buf = Buffer.alloc(0), dec = null;
+    st.conns++; s.on('error', () => {}); s.on('close', () => { st.closed = (st.closed ?? 0) + 1; }); let buf = Buffer.alloc(0), dec = null;
     s.on('data', d => {
       st.got += d.length;
       if (dec) { st.plain = Buffer.concat([st.plain, dec.update(d)]); return; }
@@ -83,5 +83,31 @@ test('Node 中继：/health、错误握手、完整 lane 经 direct 到假 DC', 
     assert.equal(dc.st.conns, 1);
     assert.deepEqual(asked, [{ hostname: W.dcAddr(1).host, port: 443 }]);
     const closed = new Promise(ok => { ws.onclose = e => ok(e.code); }); ws.close(1000); assert.equal(await closed, 1000);
+  } finally { await relay.close(); dc.srv.close(); }
+});
+
+// cloudflared 断开时常只发 FIN、不发 close 帧；中继必须随之关闭 socket 和 lane，否则 socket 卡在 CLOSE-WAIT、DC 连接泄漏
+test('Node 中继：对端只发 FIN 时关闭 lane 和 DC 连接', async () => {
+  const dc = await fakeDc();
+  const relay = await start({ port: 0, env: ENV, proto: 'http', connect: () => tcpOpen({ hostname: '127.0.0.1', port: dc.port }) });
+  const base = 'http://127.0.0.1:' + relay.port;
+  try {
+    const s = await fetch(base + '/api/v1/session', { method: 'POST', headers: { Authorization: 'Bearer ' + ENV.BOOT, 'Content-Type': 'application/octet-stream' }, body: new Uint8Array([0x10, 0, 0, 0, 0, 0, 0, 1, 1]) });
+    const token = s.headers.get('X-Session-Token'), sid = 3;
+    const sock = net.connect(relay.port, '127.0.0.1'); sock.on('error', () => {});
+    await new Promise(ok => sock.once('connect', ok));
+    sock.write('GET /api/v1/ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ' + crypto.randomBytes(16).toString('base64') + '\r\nSec-WebSocket-Protocol: tproxy-lane-v1.' + token + '.' + sid + '\r\n\r\n');
+    const masked = p => { const m = crypto.randomBytes(4), h = p.length < 126 ? Buffer.from([0x82, 0x80 | p.length]) : Buffer.from([0x82, 0xfe, p.length >> 8, p.length & 255]); return Buffer.concat([h, m, Buffer.from(p.map((v, i) => v ^ m[i & 3]))]); };
+    let resp = ''; await new Promise(ok => sock.on('data', d => { resp += d.toString('latin1'); if (resp.includes('\r\n\r\n')) ok(); }));
+    assert.match(resp, /^HTTP\/1\.1 101/);
+    const head = clientHead(), { up } = clientCiphers(head);
+    sock.write(masked(frame(sid, 1))); sock.write(masked(frame(sid, 2, Buffer.concat([head, up.update(PKT(40))]))));
+    for (let k = 0; k < 100 && !dc.st.tag; k++) await new Promise(r => setTimeout(r, 20));
+    assert.equal(dc.st.conns, 1, 'lane 已连到 DC');
+    const gone = new Promise(ok => sock.once('close', ok));
+    sock.end(); // 只发 FIN
+    await Promise.race([gone, new Promise((_, bad) => setTimeout(() => bad(Error('relay kept socket open after FIN')), 3000))]);
+    for (let k = 0; k < 100 && !dc.st.closed; k++) await new Promise(r => setTimeout(r, 20));
+    assert.equal(dc.st.closed, 1, 'DC 连接随 lane 关闭');
   } finally { await relay.close(); dc.srv.close(); }
 });

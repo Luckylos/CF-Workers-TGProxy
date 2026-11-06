@@ -45,6 +45,8 @@ class Peer extends EventTarget {
     this.sock = sock; this.readyState = 1; sock.setNoDelay(true);
     sock.on('data', d => this.onBytes(d));
     sock.on('error', () => {});
+    // upgrade 后的 socket 是 allowHalfOpen：对端只发 FIN（cloudflared 常见）时要自己关，否则卡在 CLOSE-WAIT、lane 不释放
+    sock.on('end', () => sock.destroy());
     sock.on('close', () => this.emitClose(this.closeCode ?? 1006, this.closeCode !== undefined));
     if (head?.length) this.onBytes(head);
   }
