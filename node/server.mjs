@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { register } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { tcpOpen } from './sockets.mjs';
+import { respond } from './http.mjs';
 
 register('./hooks.mjs', import.meta.url);
 const { mkApp } = await import('../telegram_webproxy.js');
@@ -91,46 +92,40 @@ class Peer extends EventTarget {
 // Node 侧运行时：升级时返回一个 Peer，server 在 upgrade 事件里把它绑到 socket 上
 const nodeRt = connect => ({ connect, upgrade: proto => { const ws = new Peer(); return { ws, response: { status: 101, webSocket: ws, headers: new Headers({ 'Sec-WebSocket-Protocol': proto }) } }; } });
 
-const toRequest = (req, body, proto) => {
+const toRequest = (req, body, proto, signal) => {
   const headers = new Headers();
   for (let i = 0; i < req.rawHeaders.length; i += 2) headers.append(req.rawHeaders[i], req.rawHeaders[i + 1]);
   const host = req.headers.host || 'localhost';
-  return new Request(new URL(req.url, proto + '://' + host), { method: req.method, headers, body: body?.length ? body : undefined });
+  return new Request(new URL(req.url, proto + '://' + host), { method: req.method, headers, body: body?.length ? body : undefined, signal });
 };
 const readBody = req => new Promise((ok, bad) => {
   const parts = []; let n = 0;
   req.on('data', d => { n += d.length; if (n > MAX_BODY) { bad(Error('body')); req.destroy(); } else parts.push(d); });
   req.on('end', () => ok(Buffer.concat(parts))); req.on('error', bad);
 });
-const plain = (status) => 'HTTP/1.1 ' + status + ' ' + (http.STATUS_CODES[status] || '') + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n';
 
 // proto：访客实际使用的协议，用于拼 URL（Origin 校验依赖它）；经 Cloudflare Tunnel 时是 https
 // connect：可替换的 TCP 打开函数（测试用它指向假 DC），默认 node:net
 export const start = async ({ port = 8787, host = '127.0.0.1', env, proto = 'https', connect = addr => tcpOpen(addr) } = {}) => {
   const app = mkApp(nodeRt(connect));
-  const srv = http.createServer(async (req, res) => {
-    try {
-      const body = req.method === 'GET' || req.method === 'HEAD' ? null : await readBody(req);
-      const r = await app.fetch(toRequest(req, body, proto), env);
-      const out = Buffer.from(await r.arrayBuffer());
-      res.writeHead(r.status, [...r.headers].flat());
-      res.end(req.method === 'HEAD' ? undefined : out);
-    } catch { if (!res.headersSent) res.writeHead(500); res.end(); }
-  });
+  const srv = http.createServer((req, res) => respond(req, res, async signal => {
+    const body = req.method === 'GET' || req.method === 'HEAD' ? null : await readBody(req);
+    return app.fetch(toRequest(req, body, proto, signal), env);
+  }));
   const live = new Set();
-  srv.on('upgrade', async (req, sock, head) => {
+  srv.on('upgrade', (req, sock, head) => {
     sock.on('error', () => {}); live.add(sock); sock.on('close', () => live.delete(sock));
-    try {
-      const key = req.headers['sec-websocket-key'];
-      if (!key || req.headers['sec-websocket-version'] !== '13') return sock.end(plain(400));
-      const r = await app.fetch(toRequest(req, null, proto), env);
-      if (r.status !== 101 || !r.webSocket) return sock.end(plain(r.status));
+    const key = req.headers['sec-websocket-key'];
+    return respond(req, sock, signal => {
+      if (!key || req.headers['sec-websocket-version'] !== '13') return new Response(null, { status: 400 });
+      return app.fetch(toRequest(req, null, proto, signal), env);
+    }, r => {
       const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
       const lines = ['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade', 'Sec-WebSocket-Accept: ' + accept];
       const sp = r.headers.get('Sec-WebSocket-Protocol'); if (sp) lines.push('Sec-WebSocket-Protocol: ' + sp);
       sock.write(lines.join('\r\n') + '\r\n\r\n');
       r.webSocket.bind(sock, head);
-    } catch { sock.destroy(); }
+    });
   });
   srv.on('clientError', (_, sock) => sock.destroy());
   srv.keepAliveTimeout = 65000;

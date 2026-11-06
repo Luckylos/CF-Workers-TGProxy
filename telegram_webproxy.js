@@ -44,7 +44,48 @@ const mkCfg = ({ SECRET, BOOT, PROXY, DECOY }) => { const secret = String(SECRET
 // 伪装站：未签名的 / 和未知路径透传到 DECOY（只取 origin），只放行少量请求/响应头，不带 cookie 和访客 IP
 const parseDecoy = v => { const s = String(v ?? '').split('#')[0].trim(); if (!s) return null; const u = new URL(s); if (!/^https?:$/.test(u.protocol) || u.username || u.password || u.search || u.hash || u.pathname !== '/') throw Error(); return u.origin; };
 const DECOY_REQ = ['accept', 'accept-language', 'user-agent'], DECOY_RES = ['content-type', 'cache-control', 'expires', 'last-modified', 'etag', 'location'];
-async function decoy(base, url, req) { if (req.method !== 'GET' && req.method !== 'HEAD') return reply(); try { const h = new Headers(); for (const k of DECOY_REQ) { const v = req.headers.get(k); if (v) h.set(k, v); } const r = await fetch(base + url.pathname + url.search, { method: req.method, headers: h, redirect: 'manual', signal: AbortSignal.timeout(PROXY_MS) }); const out = new Headers(); for (const k of DECOY_RES) { let v = r.headers.get(k); if (!v) continue; if (k === 'location' && (v === base || v.startsWith(base + '/'))) v = v.slice(base.length) || '/'; out.set(k, v); } return new Response(req.method === 'HEAD' ? null : r.body, { status: r.status, headers: out }); } catch { return reply(); } }
+async function decoy(base, url, req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return reply();
+  const ac = new AbortController();
+  let timer, reader, controller, finished = false;
+  const cleanup = () => { clearTimeout(timer); req.signal.removeEventListener('abort', onAbort); };
+  const cancel = reason => {
+    if (finished) return;
+    finished = true; cleanup(); ac.abort(reason);
+    return Promise.resolve(reader?.cancel(reason)).catch(() => {}).finally(() => reader?.releaseLock());
+  };
+  const onAbort = () => { controller?.error(req.signal.reason); void cancel(req.signal.reason); };
+  try {
+    timer = setTimeout(() => ac.abort(Error('decoy headers timeout')), PROXY_MS);
+    req.signal.addEventListener('abort', onAbort, { once: true });
+    if (req.signal.aborted) throw req.signal.reason;
+    const h = new Headers();
+    for (const k of DECOY_REQ) { const v = req.headers.get(k); if (v) h.set(k, v); }
+    const r = await fetch(base + url.pathname + url.search, { method: req.method, headers: h, redirect: 'manual', signal: ac.signal });
+    clearTimeout(timer);
+    if (finished) { await r.body?.cancel(); return reply(); }
+    const out = new Headers();
+    for (const k of DECOY_RES) { let v = r.headers.get(k); if (!v) continue; if (k === 'location' && (v === base || v.startsWith(base + '/'))) v = v.slice(base.length) || '/'; out.set(k, v); }
+    if (req.method === 'HEAD' || !r.body) { await r.body?.cancel(); finished = true; cleanup(); return new Response(null, { status: r.status, headers: out }); }
+    reader = r.body.getReader();
+    const body = new ReadableStream({
+      start(c) { controller = c; },
+      async pull(c) {
+        // Only a pending upstream read counts as idle; downstream backpressure starts no timer.
+        timer = setTimeout(() => { const err = Error('decoy body idle timeout'); c.error(err); void cancel(err); }, 30000);
+        try {
+          const { value, done } = await reader.read();
+          clearTimeout(timer);
+          if (finished) return;
+          if (done) { finished = true; cleanup(); reader.releaseLock(); c.close(); }
+          else c.enqueue(value);
+        } catch (err) { if (!finished) { c.error(err); await cancel(err); } }
+      },
+      cancel,
+    }, { highWaterMark: 0 });
+    return new Response(body, { status: r.status, headers: out });
+  } catch (err) { await cancel(err); return reply(); }
+}
 async function mkCap(secret, host) { const key = macKey( getKey(secret, true), `bridge:${String(secret).trim().toLowerCase()}`, ); const sig = await sign( key, txt.encode(`tdesktop-web-proxy-bridge-v1\n${hostOf(host)}`), ); return b64(sig); }
 async function bridge(url, secret) { if (url.pathname !== '/' || url.search.length !== 51) return null; const cand = url.search.slice(8); if (url.search !== `?bridge=${cand}` || !/^[A-Za-z0-9_-]{43}$/.test(cand)) return null; const host = hostOf(url.hostname); const want = await mkCap(secret, host); if (cand.length !== want.length) return null; let diff = 0; for (let i = 0; i < want.length; i++) diff |= cand.charCodeAt(i) ^ want.charCodeAt(i); return diff === 0 ? host : null; }
 const sha = async v => new Uint8Array(await CRYPTO.subtle.digest('SHA-256', u8(v)));

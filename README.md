@@ -292,6 +292,8 @@ Node 中继的桥接页面是源站返回的 HTML，会经过 Cloudflare 的 HTM
 
 任一必填项缺失或 `PROXY` / `DECOY` 非法时，`mkCfg` 抛错，`/health` 返回 `500`。
 
+伪装站等待响应头最多 7.5 秒，收到头后清除该计时；响应 body 仅在等待下一块上游数据时限空闲 30 秒，持续传输不设总时长上限。Node 中继按客户端背压流式写回普通 HTTP 与失败的 WebSocket 升级响应，客户端断开会取消上游；背压暂停读取不计入上游空闲。等待头失败返回空 `404`；响应开始后若上游 body 出错或空闲超时，则异常断开下游。出站代理握手仍限时 7.5 秒。
+
 ### 代码内常量
 
 | 变量 | 意义 | 值 |
@@ -395,6 +397,7 @@ node --test test/*.test.mjs
 - `test/proxy.test.mjs`：`parseProxy`、`mkCfg`、`dcAddr`、SOCKS5 / HTTP CONNECT 握手、认证失败、超时、取消、握手后双向转发
 - `test/fixes.test.mjs`：下行合包（`mkPack`）、`mkHead` 排除规则、lease 上限、token 续期；桥接页面的续期逻辑在 `vm` 里真实运行页面脚本验证
 - `test/node.test.mjs`：`PROXY=direct`；Node 中继端到端（`/health`、错误握手、完整 lane 经假 DC 双向核对明文）
+- `test/http-adapter.test.mjs`：本地假伪装站与 raw TCP，验证流式首块、持续传输、背压、响应头与 body 空闲超时、取消、失败升级及最终 flush 清理
 - `test/load.mjs`：测试用加载器，把 `cloudflare:sockets` 替换为 `node:net` 实现并导出内部符号
 
 仅依赖 Node 内置模块。真实 Telegram 连接、真实代理线路、Cloudflare 平台行为需要部署后验收。
