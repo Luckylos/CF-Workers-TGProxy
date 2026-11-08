@@ -102,12 +102,12 @@ openssl rand -hex 24   # BOOT：只给 Worker 自己用，不需要告诉别人
 name = "tgproxy"
 main = "telegram_webproxy.js"
 compatibility_date = "2025-06-01"
-compatibility_flags = ["no_web_socket_compression"]
+compatibility_flags = ["no_web_socket_compression", "enable_request_signal"]
 
 routes = [{ pattern = "tg.example.com/*", zone_name = "example.com" }]
 ```
 
-`compatibility_flags` 这一行不要省略，原因见「设计摘要 → 关闭 WebSocket 压缩」。在控制台部署时，到 Worker 的 Settings → Compatibility flags 里手动添加 `no_web_socket_compression`。
+`compatibility_flags` 这一行不要省略：`no_web_socket_compression` 减少密文转发的 CPU 消耗，原因见「设计摘要 → 关闭 WebSocket 压缩」；`enable_request_signal` 使 Worker 能通过 `Request.signal` 接收入站请求的取消通知，在上述兼容日期下需要显式启用。通过控制台部署时，到 Worker 的 Settings → Compatibility flags 添加这两项。见 [Cloudflare 请求取消说明](https://developers.cloudflare.com/changelog/2025-05-22-handle-request-cancellation/)。
 
 `pattern` 里的主机名就是客户端将来填写的**入口主机名**。若域名不在 Cloudflare，或想走优选 IP，见 [SaaS 优选入口教程](./docs/saas-preferred-entry.md)。
 
